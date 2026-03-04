@@ -49,7 +49,8 @@ cd guides/inference-scheduling
 ```
 
 <!-- TABS:START -->
-<!-- TAB:GPU deployment  -->
+
+<!-- TAB:GPU deployment:default -->
 
 #### GPU deployment
 
@@ -57,7 +58,7 @@ cd guides/inference-scheduling
 helmfile apply -n ${NAMESPACE}
 ```
 
-<!-- TAB:CPU deployment  -->
+<!-- TAB:CPU deployment -->
 
 #### CPU-only deployment
 
@@ -67,9 +68,15 @@ helmfile apply -e cpu -n ${NAMESPACE}
 
 <!-- TABS:END -->
 
-**_NOTE:_** You can set the `$RELEASE_NAME_POSTFIX` env variable to change the release names. This is how we support concurrent installs. Ex: `RELEASE_NAME_POSTFIX=inference-scheduling-2 helmfile apply -n ${NAMESPACE}`
+**_NOTE:_** By default, this guide creates 8 vLLM pods. For development and testing, the number can be reduced by adding `--set ms-inference-scheduling.decode.replicas=1` to the helmfile command. For example:
+```bash
+helmfile apply -n ${NAMESPACE} --set ms-inference-scheduling.decode.replicas=1
+```
 
-### Gateway and Hardware Options
+**_NOTE:_** You can set the `$RELEASE_NAME_POSTFIX` env variable to change the release names. This is how we support concurrent installs. The value must follow DNS-1035 naming conventions: consist of lowercase alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character. Ex: `RELEASE_NAME_POSTFIX=inference-scheduling-2 helmfile apply -n ${NAMESPACE}`
+
+<details>
+<summary><h3>Advanced Gateway and Hardware Options</h3></summary>
 
 #### Gateway Options
 
@@ -126,6 +133,8 @@ accelerator:
 ##### CPU Inferencing
 
 This case expects using 4th Gen Intel Xeon processors (Sapphire Rapids) or later.
+
+</details>
 
 ### Install HTTPRoute When Using Gateway option
 
@@ -207,6 +216,42 @@ replicaset.apps/gaie-inference-scheduling-epp-59c5f64d7b                        
 replicaset.apps/infra-inference-scheduling-inference-gateway-istio-55fd84c7fd   1         1         1       36m
 replicaset.apps/ms-inference-scheduling-llm-d-modelservice-decode-866b7c8768    8         8         8       35m
 ```
+
+### Test the Deployment
+
+You can verify the deployment is working by creating a port-forward to the Istio gateway service and sending a curl command:
+
+```bash
+# Create port-forward to the gateway service
+kubectl port-forward -n ${NAMESPACE} svc/infra-inference-scheduling-inference-gateway-istio 8080:80
+```
+
+In another terminal, send a test request:
+
+```bash
+# Test with a simple completion request
+curl -X POST http://localhost:8080/v1/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-32B",
+    "prompt": "Hello, how are you?",
+    "max_tokens": 50
+  }'
+```
+
+Or test with a chat completion:
+
+```bash
+curl -X POST http://localhost:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen/Qwen3-32B",
+    "messages": [{"role": "user", "content": "Hello, how are you?"}],
+    "max_tokens": 50
+  }'
+```
+
+**_NOTE:_** If you set a custom `RELEASE_NAME_POSTFIX`, replace `infra-inference-scheduling-inference-gateway-istio` with `infra-${RELEASE_NAME_POSTFIX}-inference-gateway-istio` in the port-forward command.
 
 ## Using the stack
 
