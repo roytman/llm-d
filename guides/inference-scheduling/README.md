@@ -16,7 +16,7 @@ This example out of the box uses 16 GPUs (8 replicas x 2 GPUs each) of any suppo
 - **Intel Gaudi (HPU)**: Gaudi 1, Gaudi 2, or Gaudi 3 with DRA support
 - **TPUs**: Google Cloud TPUs (when using GKE TPU configuration)
 
-**Using fewer accelerators**: Fewer accelerators can be used by modifying the `values.yaml` corresponding to your deployment. For example, to use only 2 GPUs with the default NVIDIA GPU deployment, update `replicas: 2` in [ms-inference-scheduling/values.yaml](./ms-inference-scheduling/values.yaml#L17-L22).
+**Using fewer accelerators**: Fewer accelerators can be used by modifying the `values.yaml` corresponding to your deployment. For example, to use only 2 GPUs with the default NVIDIA GPU deployment, update `replicas: 2` in [ms-inference-scheduling/values.yaml](./ms-inference-scheduling/values.yaml#L17-L36).
 
 **Alternative CPU Deployment**: For CPU-only deployment (no GPUs required), see the [Hardware Backends](#hardware-backends) section for CPU-specific deployment instructions. CPU deployment requires Intel/AMD CPUs with 64 cores and 64GB RAM per replica.
 
@@ -68,11 +68,8 @@ helmfile apply -e cpu -n ${NAMESPACE}
 
 <!-- TABS:END -->
 
-**_NOTE:_** By default, this guide creates 8 vLLM pods. For development and testing, the number can be reduced by adding `--set ms-inference-scheduling.decode.replicas=1` to the helmfile command. For example:
+**_NOTE:_** By default, this guide creates 8 vLLM pods. For development and testing, the number can be reduced by updating number of `replicas` in [ms-inference-scheduling/values.yaml](./ms-inference-scheduling/values.yaml#L36)
 
-```bash
-helmfile apply -n ${NAMESPACE} --set ms-inference-scheduling.decode.replicas=1
-```
 
 **_NOTE:_** You can set the `$RELEASE_NAME_POSTFIX` env variable to change the release names. This is how we support concurrent installs. The value must follow DNS-1035 naming conventions: consist of lowercase alphanumeric characters or '-', start with an alphabetic character, and end with an alphanumeric character. Ex: `RELEASE_NAME_POSTFIX=inference-scheduling-2 helmfile apply -n ${NAMESPACE}`
 
