@@ -10,6 +10,11 @@ An llm-d [well-lit path](../docs/wip-docs-new/getting-started/README.md#well-lit
 
 llm-d uses the [Gateway API Inference Extension](https://gateway-api-inference-extension.sigs.k8s.io/) to extend standard Kubernetes proxies into inference-aware proxies. The proxy receives client traffic and consults the llm-d scheduler (EPP) via [ext-proc](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter) to route each request to the optimal model server. For a deeper look at how this works, see the [proxy architecture doc](../docs/wip-docs-new/architecture/core/proxy.md).
 
+> [!NOTE]
+> The project provides tools for automatic Envoy installation. However, if you install or
+> configure it yourself, please note that the only supported [request_body_mode and response_body_mode](https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/ext_proc/v3/external_processor.proto)
+> is `FULL_DUPLEX_STREAMED`
+
 There are two deployment modes to choose from:
 
 #### Option 1: Standalone (default)

@@ -10,6 +10,11 @@ The EPP is the "brains" of an llm-d deployment. It is focused on two key objecti
 
 The EPP is an extensible component that integrates with the proxy layer via Envoy's [External Processing (ext-proc)](https://www.envoyproxy.io/docs/envoy/latest/configuration/http/http_filters/ext_proc_filter) protocol.
 
+> [!NOTE]
+> The project provides tools for automatic Envoy installation. However, if you install or
+> configure it yourself, please note that the only supported [request_body_mode and response_body_mode](https://www.envoyproxy.io/docs/envoy/latest/api-v3/service/ext_proc/v3/external_processor.proto)
+> is `FULL_DUPLEX_STREAMED`
+
 When a request arrives at the proxy, the proxy calls the EPP to select a backend endpoint, and the EPP returns the optimal pod address according to the [Endpoint Picking Protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/tree/main/docs/proposals/004-endpoint-picker-protocol).
 
 ## Design
