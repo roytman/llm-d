@@ -121,7 +121,7 @@ and E/PD variants, and the Coordinator can skip the cascade entirely via its
 their context on why headers were the right call at the time is worth including for
 fairness before this goes out.*
 
-## 2. Design goals, and the one worth leading with
+## 2. Design goals
 
 The Coordinator's design serves six goals, each traceable directly to an architectural
 choice:
@@ -133,9 +133,61 @@ choice:
 | Stateless | Per-request `RequestContext`; any replica serves any request; scales behind a plain load balancer, no coordination between instances |
 | Tokens-in / tokens-out operation | Steps exchange token IDs on `RequestContext` instead of raw text, which keeps an RL training loop in token space with no detokenize/re-tokenize round-trips |
 | One tokenization per request | `render` tokenizes once; encode and prefill then call the token-array endpoint `/inference/v1/generate` with those IDs (`use_openai_format: false`) instead of `/v1/chat/completions`, so no worker re-tokenizes. Experimental; the OpenAI-format path is the tested default |
-| No sidecar dependency | Orchestration moves off the decode pod into a standalone service in front of the Gateway |
+| No sidecar dependency | Orchestration moves off the decode pod into a standalone service in front of the Inference Gateway |
 
-The first row is the one to sit with, because it's the most concrete win for whoever
+### Goal by goal
+
+**Composable steps, easy extension.** The pipeline is an ordered list of named steps
+resolved from YAML at startup, and the executor runs them top to bottom without knowing
+what any of them does. The built-ins are themselves just steps registered this way:
+`async-broker`, `replace-media-urls`, `render`, `conditional-decode`, `encode`,
+`prefill`, `decode`. Nothing about that list is privileged, which is what makes adding
+to it cheap; the next subsection walks through what writing one actually involves.
+
+**Deferred, per-phase selection.** Because every phase is its own call back through the
+Gateway, every phase gets its own `ext_proc` cycle and its own scheduling profile,
+chosen by the `EPP-Profile` header and narrowed to the right role by a filter
+(`encode-filter`, `prefill-filter`, `decode-filter`) inside a single EPP. The practical
+consequence is that a later decision can depend on what an earlier phase returned, which
+the one-cycle model structurally cannot express. The `conditional-decode` step is the
+clearest example: it optimistically calls decode first, and only if that pod answers
+`412 Precondition Failed` does the coordinator fall through to the full encode/prefill
+cascade. Under the header model that choice would have to be guessed before decode was
+ever contacted.
+
+**Stateless.** Everything the pipeline needs for a request lives on a per-request
+`RequestContext`, including the token IDs from `render`, the `ECTransferParams` handed
+from encode to prefill, and the `KVTransferParams` handed from prefill to decode. No
+state outlives the request and no replica knows anything another replica needs, so the
+Coordinator deploys as a plain Deployment behind a Service: scale it out, roll it,
+restart it, with no leader election, no sharding, and no sticky routing. The operational
+story is the same as for any stateless proxy; in-flight requests on a dying pod fail,
+and everything else is unaffected.
+
+**Tokens-in / tokens-out operation.** Steps pass token IDs to each other rather than
+re-serialized text. For an RL training loop that matters more than it sounds: a
+detokenize/re-tokenize round-trip between phases can land on different token boundaries
+than the ones the policy actually sampled, so the trajectory you train on stops matching
+the trajectory you generated. Keeping the whole path in token space removes that class
+of mismatch entirely instead of papering over it.
+
+**One tokenization per request.** `render` tokenizes the prompt once, and encode and
+prefill then post those IDs to the token-array endpoint `/inference/v1/generate` rather
+than `/v1/chat/completions`, so no worker re-does the work. This is gated on
+`use_openai_format: false`, and it is still experimental; the OpenAI-format path remains
+the tested default, and decode always forwards on the client's original path regardless
+of the setting. Treat the saving as a real but not-yet-default optimization.
+
+**No sidecar dependency.** Nothing extra runs on the decode pod, so there is no sidecar
+image to build, version, or upgrade in lockstep with vLLM, and no per-pod container to
+co-schedule and debug. What replaces it is one standalone service plus a default Gateway
+route, which is a single thing to run for the whole cluster instead of one per decode
+replica. That is a straight trade, not a free win: the Coordinator is a new component in
+the request path, and section 3 accounts for what that costs.
+
+### Writing a step
+
+The first goal is the one to sit with, because it's the most concrete win for whoever
 has to extend this thing. A step implements two methods:
 
 ```go
