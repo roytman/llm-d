@@ -3,9 +3,9 @@ Title: Defer the Decision: A Modular Coordinator for Disaggregated LLM Inference
 Description
 The Gateway API Inference Extension is structurally one request in, one decision out: the endpoint picker cannot choose a prefill pod, wait, then choose decode. llm-d's first answer was a sidecar on every decode pod, with every pod choice frozen up front and chained through HTTP headers.
 
-The Coordinator replaces it with one stateless service in front of the same Inference Gateway: an ordered pipeline of plugin steps (media fetch, render, encode, prefill, decode), one EPP call per phase.
+The Coordinator replaces it with one stateless service in front of the same Inference Gateway: an ordered pipeline of plugin steps, one EPP call per phase.
 
-Three wins follow. Modularity: a step implements two methods, registers a name, and is enabled in YAML, and cross-phase state rides the request context, so a new stage needs no new header contract. Deferred decisions: conditional-decode asks decode first with "Prefer: if-available" and skips encode and prefill on a cache hit. Collapsed tokenization: render tokenizes once, workers consume token arrays.
+Three wins follow, and the design opens room for further optimizations. Modularity: a step implements two methods, registers a name, and is enabled in YAML; cross-phase state rides the request context, so a new stage needs no new header contract. Deferred decisions: every pod is picked immediately before its request is forwarded, not at t=0, so conditional-decode can skip encode and prefill on a cache hit. Collapsed tokenization: render tokenizes once, workers consume token arrays.
 
 We cover the design, benchmarks, and where it does not pay off.
 
