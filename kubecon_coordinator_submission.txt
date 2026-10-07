@@ -1,0 +1,26 @@
+Title: Defer the Decision: A Modular Coordinator for Disaggregated LLM Inference
+
+Description
+The Gateway API Inference Extension is structurally one request in, one decision out: the endpoint picker cannot choose a prefill pod, wait, then choose decode. llm-d's first answer was a sidecar on every decode pod, with every pod choice frozen up front and chained through HTTP headers.
+
+The Coordinator replaces it with one stateless service in front of the same Inference Gateway: an ordered pipeline of plugin steps (media fetch, render, encode, prefill, decode), one EPP call per phase.
+
+Three wins follow. Modularity: a step implements two methods, registers a name, and is enabled in YAML, and cross-phase state rides the request context, so a new stage needs no new header contract. Deferred decisions: conditional-decode asks decode first with "Prefer: if-available" and skips encode and prefill on a cache hit. Collapsed tokenization: render tokenizes once, workers consume token arrays.
+
+We cover the design, benchmarks, and where it does not pay off.
+
+
+Benefits to the ecosystem
+Disaggregated inference is now the default deployment shape: prefill and decode on separate pods, encode on its own hardware for multimodal models, KV and embedding caches transferred over RDMA between them. But Kubernetes-native routing for these workloads is built on a protocol that was designed for a single decision. Envoy's ext_proc gives the endpoint picker one shot per request, and the EPP cannot make a downstream call of its own. Every project hitting this limit has reached for the same workaround: decide everything at t=0, encode the answers in headers, and have something downstream replay them. llm-d shipped exactly that, and this talk is an honest account of why the project moved off it.
+
+This matters to the ecosystem on four fronts:
+
+(1) Modularity as a protocol question, not a code-quality one. Header-chaining does not compose: three KV connector protocols, encode fan-out, and data-parallel support each accumulated their own header contract inside one sidecar struct. The Coordinator's step interface is two methods and a registry entry, with cross-phase state on a per-request context instead of the wire. Attendees building their own stages (safety filtering, tool-call validation, speculative draft models, RL rollouts) get a concrete pattern for extending an inference pipeline without touching the pipeline or the gateway.
+
+(2) Deferred decisions are expressible, and sometimes worth it. One EPP call per phase means a later choice can depend on an earlier phase's result. conditional-decode is the demonstration: RFC 7240's "Prefer: if-available" asks a decode worker whether it already holds the prompt, and a 412 Precondition Failed is read as information rather than an error. We will show the measured envelope: roughly 10% lower median latency and 12% lower TTFT at 50 concurrent requests on a 56-GPU DeepSeek-V2 deployment, 4-10% higher throughput and 15% lower p99 TTFT on bursty Qwen3-VL-235B traffic, and equally a 4-8% TTFT cost when prefill is the bottleneck plus 1.8-4.9% higher TTFT on single-request serving. The win is narrow and conditional, and knowing its shape is more useful than the number.
+
+(3) Tokenizing once. Today a single request can be tokenized several times over: by the encode EPP and the prefill EPP to score prefix caches, then again by each vLLM worker. A render step that tokenizes once and passes token arrays to workers removes that redundancy and, as a side effect, gives reinforcement-learning pipelines a token-space path with no detokenize/re-tokenize round trip. We will be explicit that this is experimental and that the payload tradeoff is real: preprocessor tensors are roughly 1 MB per HD image.
+
+(4) Operational subtraction. No sidecar to build, version, and co-schedule with every decode replica; one cluster-wide stateless Deployment instead, with no leader election or sticky routing. For platform teams, removing a per-pod component from the critical path is the kind of change that is easy to evaluate and hard to regret.
+
+llm-d is a multi-vendor open-source project backed by IBM, Google Cloud, Red Hat, CoreWeave, and NVIDIA. The contribution here is not disaggregation, which vLLM supports at the engine level, but a Kubernetes-native orchestration layer that works within the Gateway API Inference Extension rather than around it, and a candid look at what it costs.
