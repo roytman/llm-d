@@ -2,28 +2,29 @@
 
 ## TLDR
 
+Under bursty, heterogeneous multimodal load, the Coordinator delivers 4-10% *higher*
+throughput than llm-d-router's sidecar, with no per-decode-pod sidecar to deploy,
+version, or upgrade at all. The cost is a few percent of TTFT for a single request and
+nothing measurable in end-to-end latency.
+
 llm-d-router disaggregates prefill and decode (and, for multimodal input, encoding)
 through a sidecar container that runs on the decode pod. The Coordinator is an
 alternative that runs the same disaggregation from a standalone service in front of the
 Inference Gateway, with no pod-local sidecar at all. Both go through the same Gateway,
-the same Endpoint Picker (EPP), and the same GAIE `ext_proc` protocol; what changes is
-*where* request orchestration is driven from, and *when* each pod gets
-picked: one EPP call per phase, made right before that phase runs, instead of one
-scheduling cycle picking every pod up front.
+the same Endpoint Picker (EPP), and the same GAIE `ext_proc` protocol. What changes is
+*where* request orchestration is driven from, and *when* each pod gets picked: one EPP
+call per phase, made right before that phase runs, instead of one scheduling cycle
+picking every pod up front.
 
 The most concrete payoff for a deployer: the pipeline is composable. A new processing
 stage is a small, self-contained Go type registered under a name and referenced from
-YAML; no need to understand the sidecar's KV-connector protocols or its central
-dispatch logic to add one. That buys no sidecar to deploy, version, or upgrade per
-decode pod, plus a foundation the sidecar's fixed cascade can't offer: branching/looping
-steps, cross-phase cancellation, and reuse of the same selection machinery for model or
-endpoint choice, not just pods. The cost is more Gateway/EPP round trips per request
-than the sidecar's single scheduling cycle. Section 5 quantifies it: a few percent on
-TTFT for a single request, nothing measurable in end-to-end latency, and under bursty
-heterogeneous multimodal load the deferred decode pick turns into 4-10% *higher*
-throughput than the sidecar.
+YAML. There's no need to understand the sidecar's KV-connector protocols or its central
+dispatch logic to add one. That composability is also a foundation for things the
+sidecar's fixed cascade can't offer: branching/looping steps, cross-phase cancellation,
+and reuse of the same selection machinery for model or endpoint choice, not just pods.
+The benchmarks section below has the full cost/benefit numbers.
 
-## 1. Why a sidecar, and why not a sidecar
+## Why disaggregation needs a sidecar — and why not forever
 
 The Gateway API Inference Extension's
 [endpoint-picker protocol](https://github.com/kubernetes-sigs/gateway-api-inference-extension/tree/main/docs/proposals/004-endpoint-picker-protocol),
@@ -83,11 +84,7 @@ Both panels show the full encode/prefill/decode cascade; the sidecar also suppor
 and E/PD variants, and the Coordinator can skip the cascade entirely via its
 `conditional-decode` step, which tries decode first and falls back on a 412.)*
 
-*This framing hasn't been checked against the sidecar maintainers' own account yet;
-their context on why headers were the right call at the time is worth including for
-fairness before this goes out.*
-
-## 2. Design goals
+## What the Coordinator does differently
 
 The Coordinator's design serves six goals, each traceable directly to an architectural
 choice:
@@ -115,9 +112,9 @@ Gateway, every phase gets its own `ext_proc` cycle and its own scheduling profil
 chosen by the `EPP-Profile` header and narrowed to the right role by a filter
 (`encode-filter`, `prefill-filter`, `decode-filter`) inside a single EPP. The practical
 consequence is that a later decision can depend on what an earlier phase returned, which
-the one-cycle model structurally cannot express. Section 5 shows this paying off as
+the one-cycle model structurally cannot express. The benchmarks section below shows this paying off as
 throughput under bursty load, where picking decode after prefill keeps the decode pods
-balanced. The `conditional-decode` step, covered in section 4, is the clearest
+balanced. The `conditional-decode` step, covered in "Two optimizations" below, is the clearest
 example: it calls decode first and only runs encode and
 prefill if that pod turns the request down. Under the header model that choice would
 have to be guessed before decode was ever contacted.
@@ -140,17 +137,16 @@ of mismatch entirely instead of papering over it.
 
 **One tokenization per request.** `render` tokenizes the prompt once and every later
 step works from those IDs, so neither the EPP nor the vLLM engine has to redo the work
-per phase. This one is experimental and is worth its own treatment; section 4 covers
+per phase. This one is experimental and is worth its own treatment; "Two optimizations" below covers
 what it replaces and what it is gated on.
 
 **No sidecar dependency.** Nothing extra runs on the decode pod, so there is no sidecar
 image to build, version, or upgrade in lockstep with vLLM, and no per-pod container to
 co-schedule and debug. What replaces it is one standalone service plus a default Gateway
 route, which is a single thing to run for the whole cluster instead of one per decode
-replica. That is a straight trade, not a free win: the Coordinator is a new component in
-the request path, and section 5 accounts for what that costs.
+replica. The benchmarks section below accounts for what that costs.
 
-## 3. Writing a new step
+## Writing a new step
 
 The first of the design goals, composability, is the one to sit with, because it's the most
 concrete win for whoever has to extend this thing. A Coordinator step implements two methods:
@@ -177,16 +173,17 @@ pipeline:
     - type: decode
 ```
 
-The pipeline executor calls steps by name and knows nothing about what's inside any of
-them. Compare that to extending the sidecar: doing so means understanding the specific
-KV-connector protocol code and the central `Server` struct's dispatch logic described in
-section 1, implementation detail a step author for the Coordinator never has to touch.
-That's the difference between writing one small, isolated Go type plus a YAML entry, and
-learning a sidecar's internals to add a capability. It's also the reason a new step
-doesn't require a new header: state a step needs from an earlier phase lives on
-`RequestContext`, not on the wire.
+The sidecar equivalent of adding `my-new-step` is not a YAML entry: it's a new header,
+a new branch in the central `Server` struct's dispatch logic, and a change every
+KV-connector protocol has to account for.
 
-## 4. Coordinator optimizations
+The pipeline executor calls steps by name and knows nothing about what's inside any of
+them. That's the difference between writing one small, isolated Go type plus a YAML
+entry, and learning a sidecar's internals to add a capability. It's also the reason a
+new step doesn't require a new header: state a step needs from an earlier phase lives
+on `RequestContext`, not on the wire.
+
+## Two optimizations
 
 Two of the design goals above are not just properties of the architecture but active
 optimizations the Coordinator performs on the request. Both exist because the pipeline
@@ -261,16 +258,67 @@ With tokens on the wire, the EPP scores against them without re-tokenizing and t
 engine has nothing left to tokenize. The whole mechanism is still experimental and gated
 on `use_openai_format: false`; the OpenAI-format path remains the tested default.
 
-## 5. What it costs, and where it wins
+## Benchmarks: cost and payoff
 
 The concrete request flow is: client → Gateway → Coordinator → (Gateway → EPP → pod) ×
-N phases. Said plainly, so it doesn't get lost in the payoff argument: this is *more*
-Gateway/EPP round trips per request than the sidecar's single scheduling cycle, through
-the same Inference Gateway. The Coordinator is an active client of the Gateway, issuing
-and consuming several requests in sequence (and, for multimodal fan-out, in parallel)
-rather than being handed one already-resolved cascade.
+N phases. This is more Gateway/EPP round trips per request than the sidecar's single
+scheduling cycle, through the same Inference Gateway. The Coordinator is an active
+client of the Gateway, issuing and consuming several requests in sequence (and, for
+multimodal fan-out, in parallel) rather than being handed one already-resolved cascade.
 
-Some of that overhead is absorbed rather than paid outright:
+### Where deferred decoding wins
+
+This is the actual differentiator, and the question it answers is: is there a benefit
+to picking the decode pod *later*? A further benchmark, currently in review as
+[llm-d#2658](https://github.com/llm-d/llm-d/pull/2658), tests it directly. The sidecar
+picks prefill and decode together before prefill starts; the Coordinator picks decode
+only once prefill has finished, by which point the pool's state may have moved.
+
+The workload is built to make that difference matter: `Qwen/Qwen3-VL-235B-A22B-Instruct`
+on 4 × H200 nodes (TP=8, 2 prefill + 2 decode pods, NIXL over GKE multi-network RDMA),
+heavy-tailed per-request load (log-normal output lengths, mean 2,500 and capped at
+11,000 tokens, plus 1-14 mixed 360p/1080p images), released in bursts of 300 to 420 so
+both decode pods sit at 85-100% KV utilization. Both arms run behind the same Gateway
+with the same EPP image and scheduling profiles, and both do prefill then decode on
+every request. Means of two repeats, sidecar / Coordinator:
+
+| Burst size | Throughput (req/s) | Mean E2E (s) | Mean TTFT (s) | P99 TTFT (s) | Mean TPOT (ms) |
+|---|---|---|---|---|---|
+| 300 | 0.93 / **1.03** | 137 / **124** | 45.9 / **41.8** | 92 / **90** | 44.0 / 44.6 |
+| 360 | 1.01 / **1.06** | 150 / **143** | 55.0 / **52.6** | 115 / **106** | 46.1 / 46.6 |
+| 420 | 1.05 / **1.15** | 171 / **154** | 64.1 / **61.1** | 147 / **124** | 52.1 / **45.7** |
+
+<p float="left">
+  <img src="https://raw.githubusercontent.com/llm-d/llm-d/2b68d2f93f1d9274a4a8d9b5268d11c0497cfe68/guides/coord-disaggregation/benchmark-results/2Px8GPU_2Dx8GPU_Qwen3-VL-235B-A22B_burst/2p2d_throughput.png" alt="2P/2D burst: throughput" width="45%" />
+  <img src="https://raw.githubusercontent.com/llm-d/llm-d/2b68d2f93f1d9274a4a8d9b5268d11c0497cfe68/guides/coord-disaggregation/benchmark-results/2Px8GPU_2Dx8GPU_Qwen3-VL-235B-A22B_burst/2p2d_latency.png" alt="2P/2D burst: latency" width="45%" />
+</p>
+<p float="left">
+  <img src="https://raw.githubusercontent.com/llm-d/llm-d/2b68d2f93f1d9274a4a8d9b5268d11c0497cfe68/guides/coord-disaggregation/benchmark-results/2Px8GPU_2Dx8GPU_Qwen3-VL-235B-A22B_burst/2p2d_decode_imbalance.png" alt="2P/2D burst: per-pod decode imbalance" width="60%" />
+</p>
+
+Throughput is 4-10% higher and mean E2E latency 5-10% lower at every burst size. At 420
+requests, p99 TTFT drops 15% and mean TPOT 12%. The per-pod traces show the mechanism
+rather than just the outcome: under the sidecar the two decode pods start level and
+drift apart as short requests finish, because every placement was fixed at t=0, until
+one pod exhausts its KV with 84 requests queued behind it while the other drains. Under
+the Coordinator they stay within about 15 in-flight requests of each other for the whole
+burst.
+
+This is the "deferred, per-phase selection" goal showing up as throughput, and it is the
+one place where the architecture does more than break even. It is also narrow, and the
+guide is explicit about the conditions: decode has to be the contended stage, per-request
+load has to be heterogeneous enough that an equal count of requests is not an equal load,
+and placement has to be committed in bulk (bursts rather than a steady stream). Where
+prefill is the bottleneck instead, the same benchmark measures the Coordinator's extra
+per-phase hop costing 4-8% of TTFT with nothing to show for it. The sidecar's early pick
+is not working from stale data — it's an exact in-process reservation made before
+prefill starts — so the later pick adds information only when the pool's state actually
+changes in between.
+
+### What the extra hop costs
+
+The cost was flagged above: this is more Gateway/EPP round trips per request than the
+sidecar's single scheduling cycle. Some of that is absorbed rather than paid outright:
 
 - Multimodal encode fan-out already runs in parallel: one Gateway call per multimodal
   entry, concurrently, not serialized per item.
@@ -283,21 +331,13 @@ Some of that overhead is absorbed rather than paid outright:
   already holds what it needs, it serves the request directly and the rest of the
   pipeline (encode, prefill) never runs at all.
 
-The net argument is that this bounded overhead is paid back by not deploying,
-versioning, and upgrading a sidecar per decode pod, plus the composability payoff from
-sections 2 and 3. Whether "bounded" holds up under load is an empirical claim, not a
-rhetorical one, so:
-
-### Benchmarks
-
 The
 [coord-disaggregation guide](https://github.com/llm-d/llm-d/tree/main/guides/coord-disaggregation#benchmark)
-measures exactly this. To isolate the hop count rather than comparing two different
+measures what's left. To isolate the hop count rather than comparing two different
 decisions about whether to disaggregate at all, both sides were forced down the full
 prefill → decode path: the sidecar ran with `always-disagg-pd-decider`, and the
 Coordinator ran a PD-only pipeline with no `conditional-decode` step, so its optimistic
-fast path never fired. What's left between them is the Coordinator's extra Gateway/EPP
-round trip per phase.
+fast path never fired.
 
 **Single request, `openai/gpt-oss-120b` on H200s** (decode 1×TP4, prefill 1×TP1, 5 GPUs,
 identical on both sides, prefill and decode pinned to the same nodes to keep node
@@ -337,61 +377,12 @@ to 500, 100% success on both sides):
   <img src="https://raw.githubusercontent.com/llm-d/llm-d/main/guides/coord-disaggregation/benchmark-results/6Dx4GPU_4Px8GPU_DeepSeek-V2_concurrent/request_latency_distribution.png" alt="Concurrent stress spikes: request latency distribution" width="45%" />
 </p>
 
-
 So the extra hop is real and it is visible, but only in TTFT, as a consistent
 few-percent, single-digit-millisecond gap on single requests. It does not show up in ITL
 or end-to-end request latency, and under concurrent load it does not show up at all. The
-"bounded overhead" claim holds up.
-
-### Where deferred decoding wins
-
-Everything above answers one question: what does the extra hop cost? A further
-benchmark, currently in review as
-[llm-d#2658](https://github.com/llm-d/llm-d/pull/2658), asks the other one: is there a
-benefit to picking the decode pod *later*? The sidecar picks prefill and decode together
-before prefill starts; the Coordinator picks decode only once prefill has finished, by
-which point the pool's state may have moved.
-
-The workload is built to make that difference matter: `Qwen/Qwen3-VL-235B-A22B-Instruct`
-on 4 × H200 nodes (TP=8, 2 prefill + 2 decode pods, NIXL over GKE multi-network RDMA),
-heavy-tailed per-request load (log-normal output lengths, mean 2,500 and capped at
-11,000 tokens, plus 1-14 mixed 360p/1080p images), released in bursts of 300 to 420 so
-both decode pods sit at 85-100% KV utilization. Both arms run behind the same Gateway
-with the same EPP image and scheduling profiles, and both do prefill then decode on
-every request. Means of two repeats, sidecar / Coordinator:
-
-| Burst size | Throughput (req/s) | Mean E2E (s) | Mean TTFT (s) | P99 TTFT (s) | Mean TPOT (ms) |
-|---|---|---|---|---|---|
-| 300 | 0.93 / **1.03** | 137 / **124** | 45.9 / **41.8** | 92 / **90** | 44.0 / 44.6 |
-| 360 | 1.01 / **1.06** | 150 / **143** | 55.0 / **52.6** | 115 / **106** | 46.1 / 46.6 |
-| 420 | 1.05 / **1.15** | 171 / **154** | 64.1 / **61.1** | 147 / **124** | 52.1 / **45.7** |
-
-<p float="left">
-  <img src="https://raw.githubusercontent.com/llm-d/llm-d/2b68d2f93f1d9274a4a8d9b5268d11c0497cfe68/guides/coord-disaggregation/benchmark-results/2Px8GPU_2Dx8GPU_Qwen3-VL-235B-A22B_burst/2p2d_throughput.png" alt="2P/2D burst: throughput" width="45%" />
-  <img src="https://raw.githubusercontent.com/llm-d/llm-d/2b68d2f93f1d9274a4a8d9b5268d11c0497cfe68/guides/coord-disaggregation/benchmark-results/2Px8GPU_2Dx8GPU_Qwen3-VL-235B-A22B_burst/2p2d_latency.png" alt="2P/2D burst: latency" width="45%" />
-</p>
-<p float="left">
-  <img src="https://raw.githubusercontent.com/llm-d/llm-d/2b68d2f93f1d9274a4a8d9b5268d11c0497cfe68/guides/coord-disaggregation/benchmark-results/2Px8GPU_2Dx8GPU_Qwen3-VL-235B-A22B_burst/2p2d_decode_imbalance.png" alt="2P/2D burst: per-pod decode imbalance" width="60%" />
-</p>
-
-Throughput is 4-10% higher and mean E2E latency 5-10% lower at every burst size. At 420
-requests, p99 TTFT drops 15% and mean TPOT 12%. The per-pod traces show the mechanism
-rather than just the outcome: under the sidecar the two decode pods start level and
-drift apart as short requests finish, because every placement was fixed at t=0, until
-one pod exhausts its KV with 84 requests queued behind it while the other drains. Under
-the Coordinator they stay within about 15 in-flight requests of each other for the whole
-burst.
-
-This is the "deferred, per-phase selection" goal from section 2 showing up as
-throughput, and it is the one place where the architecture does more than break even.
-It is also narrow, and the guide is explicit about the conditions: decode has to be the
-contended stage, per-request load has to be heterogeneous enough that an equal count of
-requests is not an equal load, and placement has to be committed in bulk (bursts rather
-than a steady stream). Where prefill is the bottleneck instead, the same benchmark
-measures the Coordinator's extra per-phase hop costing 4-8% of TTFT with nothing to show
-for it. Worth stressing what the win is *not*: the sidecar's early pick is not working
-from stale data, it is an exact in-process reservation made before prefill starts, so
-the later pick adds information only when the pool's state actually changes in between.
+bounded-overhead claim holds up, and the composability payoff from the design-goals and
+step-authoring sections above is paid for without deploying, versioning, or upgrading a
+sidecar per decode pod.
 
 ### What the numbers don't cover
 
@@ -409,57 +400,34 @@ the Coordinator (p90-p10 of roughly 2.4-3.2ms vs. the sidecar's 0.8-1.5ms on the
 input-length sweep, plus a heavier decode tail on the output-length sweep). It doesn't
 move the median, and the linked analysis doesn't root-cause it.
 
-## 6. What this unlocks beyond disaggregation
+## What this unlocks
 
-The modularity of sections 2 and 3 is the headline win available today. Everything
-below is what the same pipeline model opens up next, each grounded in an existing design
-document, none of it shipped yet.
+The composability from the sections above is the headline win available today. Each
+idea below is grounded in an existing design document, but none of it is shipped yet:
 
-**Cycles and conditionals in the pipeline.** Today's pipeline is a flat, ordered list:
-every step runs exactly once, top to bottom. Agentic loops and tool-calling need two
-things that model doesn't have: a conditional (branch to a guardrail step; only run
-the tool-call step if the model's response actually requests a tool) and a cycle (repeat
-a sub-sequence of model call, tool call, model call until the model returns a final
-answer, or retry-with-backoff around a flaky call-out, bounded by a hard iteration cap so
-a runaway loop can't become a liveness problem). This is a change to the pipeline
-executor and the `Step` contract itself, not just new step implementations to slot in.
+- **Cycles and conditionals in the pipeline.** Today's pipeline runs every step exactly
+  once, top to bottom. Agentic loops and tool-calling need a conditional (only run the
+  tool-call step if the model actually requests one) and a cycle (repeat model-call /
+  tool-call until a final answer, bounded by a hard iteration cap). That's a change to
+  the pipeline executor and the `Step` contract, not just new steps to slot in.
+- **Request migration.** Cross-phase state lives on `RequestContext` already, which
+  makes cancellation a pipeline-wide concern for free. Migration — re-routing a request
+  to a sibling pod with a warm prefix cache before evicting it, instead of just evicting
+  it — isn't built, but the centralized state removes an obstacle to building it.
+- **The same filter/score/pick machinery, generalized past pods.** An EPP's filter →
+  score → pick flow doesn't require the candidates to be pods; the same shape works for
+  picking a model or a remote endpoint/cluster first, as a chain of single-purpose EPP
+  deployments. The Coordinator generalizes the same way: strip away
+  "encode/prefill/decode" and it's a stateless step-orchestrator that could just as well
+  call out to guardrail and tool endpoints for an agentic-loop deployment.
+- **WebSocket sessions.** `ext_proc` makes one decision per HTTP request and has no
+  per-frame decision point once a WebSocket upgrade completes, so a standalone
+  Coordinator looks like a more natural place to route a long-lived session than the
+  EPP. This is a forward-looking idea with no design doc behind it yet, and it hasn't
+  been checked against EPP maintainers, who may know of a per-frame mechanism this is
+  assuming doesn't exist.
 
-**Cancellation today; migration as a roadmap item, not a shipped feature.**
-Cross-phase state already lives on `RequestContext` instead of being scattered across
-sidecar memory and request headers, which makes context cancellation naturally a
-pipeline-wide concern rather than something each hop has to handle separately. At the
-EPP's own queue layer, cancellation is already one of the three ways a queued request
-unblocks. What is *not* implemented anywhere in the stack today is request migration:
-re-routing a request to a sibling pod with a warm prefix cache before evicting it, rather
-than just evicting it. The architecture removes an obstacle to building this (state
-that would need to move is centralized, not sidecar-local), but it doesn't build it.
-
-**The same filter/score/pick machinery, generalized past pods.** Strip away the "pod"
-framing and an EPP is a generic component: given candidate items and per-item data,
-filter down to eligible candidates, score them, pick one. Nothing about that flow
-requires the items to be pods; the same shape works for picking a model before any pod
-decision is made, or for picking a remote endpoint/cluster (which might itself aggregate
-local pod capacity, or front an external API). Each of these is its own single-purpose
-EPP deployment (a model-selection hub, then an endpoint-selection EPP, then an ordinary
-pod-selection EPP downstream), chained together rather than one EPP instance learning to
-reason about several kinds of item at once. The Coordinator generalizes the same way:
-strip away "encode/prefill/decode" and it's a stateless step-orchestrator that could just
-as well call out to guardrail services and tool endpoints for an agentic-loop
-deployment, using the same executor and the same `RequestContext` it uses for
-disaggregated inference today.
-
-**WebSocket sessions: an idea, not a plan.** `ext_proc` makes one decision per HTTP
-request. A WebSocket connection is a single HTTP request that upgrades and then carries
-an open-ended number of frames outside that request/response model, so `ext_proc` has no
-per-frame decision point once the upgrade completes. A standalone Coordinator sitting in
-front of the connection, rather than a one-shot `ext_proc` call, looks like a more
-natural place to route or re-route a long-lived session (a streaming agent conversation,
-live tool use) than trying to make the EPP reason about it. This point has no design
-doc or implementation behind it in this repository yet, and it hasn't been checked
-against EPP maintainers, who may know of a per-frame decision mechanism this outline is
-assuming doesn't exist. Treat it as a forward-looking idea until that's confirmed.
-
-## 7. Closing
+## What's next
 
 The Coordinator is one instantiation of a more general pattern: pull orchestration out
 of wherever it's structurally forced to live (a sidecar, a fixed EPP scheduling cycle)
@@ -469,20 +437,3 @@ connector protocols, and the step-authoring guide), see
 [docs/coordinator_architecture.md](docs/coordinator_architecture.md). For where the
 pipeline model is headed next, see the
 [composable EPP/Coordinator proposal](thoughts/shared/plans/proposal-composable-epp-coordinator.md).
-
----
-
-## Outstanding before this ships
-
-- [ ] Confirm section 1's sidecar framing with sidecar maintainers.
-- [ ] Measure the wall-clock value of tokenizing once (tokens-in vs. OpenAI-format);
-      section 5 flags it as the one benchmark gap left.
-- [ ] Section 5's deferred-decoding results come from llm-d#2658, still open. Either
-      wait for the merge or label the numbers as pending review in the published text.
-      Its three charts are pinned to that PR's head commit (`2b68d2f`); repoint them
-      at `llm-d/llm-d/main` once it merges.
-- [ ] Verify with EPP maintainers that per-frame `ext_proc` decisions genuinely don't
-      exist, before the WebSocket point in section 6 goes out unchanged.
-- [ ] Decide target venue/audience (llm-d blog vs. Anthropic-adjacent vs. CNCF); affects
-      how much EPP/`ext_proc` background needs spelling out for readers unfamiliar with
-      the project.
